@@ -149,7 +149,7 @@ def prepare_data(data, filters):
 
 
 def prepare_chart_data(pending, completed):
-	labels = ["Amount to Bill", "Billed Amount"]
+	labels = [_("Amount to Bill"), ("Billed Amount")]
 
 	return {
 		"data": {"labels": labels, "datasets": [{"values": [pending, completed]}]},
