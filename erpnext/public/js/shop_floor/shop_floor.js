@@ -144,7 +144,7 @@ class ShopFloor {
 		const toggle = this.can_manage
 			? `<div class="sf-view-toggle">
 					<button class="sf-view-btn ${this.view === "manager" ? "active" : ""}" data-view="manager">${__(
-					"Board"
+					"Switch Board"
 			  )}</button>
 					<button class="sf-view-btn ${this.view === "operator" ? "active" : ""}" data-view="operator">${__(
 					"Operator"
