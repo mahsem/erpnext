@@ -149,7 +149,7 @@
    "fieldname": "interest",
    "fieldtype": "Currency",
    "in_list_view": 1,
-   "label": "Interest",
+   "label": "Interest Rate",
    "options": "currency",
    "read_only": 1
   }
