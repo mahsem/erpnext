@@ -46,20 +46,18 @@ erpnext.buying = {
 
 				// no idea where me is coming from
 				if (this.frm.get_field("shipping_address")) {
-					this.frm.set_query("shipping_address", () => {
+					this.frm.set_query("shipping_address", (doc, cdt, cdn, frm) => {
 						if (this.frm.doc.customer) {
 							return {
 								query: "frappe.contacts.doctype.address.address.address_query",
 								filters: { link_doctype: "Customer", link_name: this.frm.doc.customer },
 							};
-						} else return erpnext.queries.company_address_query(this.frm.doc);
+						} else return erpnext.queries.company_address_query(doc, cdt, cdn, frm);
 					});
 				}
 
 				if (this.frm.get_field("dispatch_address")) {
-					this.frm.set_query("dispatch_address", () => {
-						return erpnext.queries.address_query(this.frm.doc);
-					});
+					this.frm.set_query("dispatch_address", erpnext.queries.address_query);
 				}
 			}
 
@@ -77,7 +75,7 @@ erpnext.buying = {
 				if (this.frm.fields_dict.tc_name) {
 					this.frm.set_query("tc_name", function () {
 						return {
-							filters: { buying: 1 },
+							filters: { buying: 1, disabled: 0 },
 						};
 					});
 				}
@@ -181,7 +179,11 @@ erpnext.buying = {
 
 						this.frm.set_value("billing_address", r.message.primary_address || "");
 
-						if (frappe.meta.has_field(this.frm.doc.doctype, "shipping_address")) {
+						const is_drop_ship = this.frm.doc.items.some((item) => item.delivered_by_supplier);
+						if (
+							frappe.meta.has_field(this.frm.doc.doctype, "shipping_address") &&
+							!is_drop_ship
+						) {
 							this.frm.set_value("shipping_address", r.message.shipping_address || "");
 						}
 					},

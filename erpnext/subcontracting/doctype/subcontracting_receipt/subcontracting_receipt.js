@@ -220,9 +220,7 @@ frappe.ui.form.on("Subcontracting Receipt", {
 
 		frm.set_query("billing_address", erpnext.queries.company_address_query);
 
-		frm.set_query("shipping_address", () => {
-			return erpnext.queries.company_address_query(frm.doc);
-		});
+		frm.set_query("shipping_address", erpnext.queries.company_address_query);
 
 		frm.set_query("rejected_warehouse", () => {
 			return {
@@ -335,7 +333,11 @@ frappe.ui.form.on("Subcontracting Receipt", {
 	},
 
 	setup_quality_inspection: (frm) => {
-		if (!frm.is_new() && frm.doc.docstatus === 0 && !frm.doc.is_return) {
+		if (
+			!frm.is_new() &&
+			(frm.doc.docstatus === 0 || frm.doc.__onload?.allow_to_make_qc_after_submission) &&
+			!frm.doc.is_return
+		) {
 			let transaction_controller = new erpnext.TransactionController({ frm: frm });
 			transaction_controller.setup_quality_inspection();
 		}

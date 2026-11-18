@@ -4,14 +4,14 @@
 frappe.provide("erpnext.buying");
 frappe.provide("erpnext.accounts.dimensions");
 
-cur_frm.cscript.tax_table = "Purchase Taxes and Charges";
-
 erpnext.accounts.taxes.setup_tax_filters("Purchase Taxes and Charges");
 erpnext.accounts.taxes.setup_tax_validations("Purchase Order");
 erpnext.buying.setup_buying_controller();
 
 frappe.ui.form.on("Purchase Order", {
 	setup: function (frm) {
+		frm.cscript.tax_table = "Purchase Taxes and Charges";
+
 		frm.set_indicator_formatter("item_code", function (doc) {
 			let color;
 			if (doc.closed) {
@@ -35,11 +35,7 @@ frappe.ui.form.on("Purchase Order", {
 
 		frm.set_query("fg_item", "items", function () {
 			return {
-				filters: {
-					is_stock_item: 1,
-					is_sub_contracted_item: 1,
-					default_bom: ["!=", ""],
-				},
+				query: "erpnext.controllers.queries.subcontracted_item_query",
 			};
 		});
 	},
@@ -332,7 +328,10 @@ erpnext.buying.PurchaseOrderController = class PurchaseOrderController extends (
 					}
 				}
 
-				if (is_drop_ship && !["Completed", "Delivered"].includes(doc.status)) {
+				if (
+					doc.items.some((item) => item.delivered_by_supplier == 1 && !item.closed) &&
+					!["Completed", "Delivered"].includes(doc.status)
+				) {
 					this.frm.add_custom_button(
 						__("Deliver (Dropship)"),
 						this.update_dropship_delivered_qty.bind(this),
@@ -414,23 +413,17 @@ erpnext.buying.PurchaseOrderController = class PurchaseOrderController extends (
 						);
 					}
 
-					if (doc.docstatus === 1 && !doc.inter_company_order_reference) {
-						let me = this;
-						let internal = me.frm.doc.is_internal_supplier;
-						if (internal) {
-							let button_label =
-								me.frm.doc.company === me.frm.doc.represents_company
-									? __("Internal Sales Order")
-									: __("Inter Company Sales Order");
+					if (doc.docstatus === 1 && doc.is_internal_supplier) {
+						let button_label =
+							doc.company === doc.represents_company
+								? __("Internal Sales Order")
+								: __("Inter Company Sales Order");
 
-							me.frm.add_custom_button(
-								button_label,
-								function () {
-									me.make_inter_company_order(me.frm);
-								},
-								__("Create")
-							);
-						}
+						this.add_inter_company_order_button(
+							button_label,
+							"Sales Order",
+							"purchase_order_item"
+						);
 					}
 				}
 
@@ -672,8 +665,7 @@ erpnext.buying.PurchaseOrderController = class PurchaseOrderController extends (
 					reqd: 1,
 				},
 			],
-			primary_action: function () {
-				var data = d.get_values();
+			primary_action: function (data) {
 				let reason_for_hold = "Reason for hold: " + data.reason_for_hold;
 
 				frappe.call({
@@ -720,7 +712,7 @@ erpnext.buying.PurchaseOrderController = class PurchaseOrderController extends (
 
 	update_dropship_delivered_qty() {
 		const data = this.frm.doc.items
-			.filter((item) => item.delivered_by_supplier == 1)
+			.filter((item) => item.delivered_by_supplier == 1 && !item.closed)
 			.map((item) => {
 				return {
 					__checked: item.qty > item.received_qty,
@@ -826,21 +818,20 @@ erpnext.buying.PurchaseOrderController = class PurchaseOrderController extends (
 	items_on_form_rendered() {
 		set_schedule_date(this.frm);
 	}
+
+	update_status(label, status) {
+		frappe.call({
+			method: "erpnext.buying.doctype.purchase_order.purchase_order.update_status",
+			args: { status: status, name: this.frm.doc.name },
+			callback: () => {
+				this.frm.set_value("status", status);
+				this.frm.reload_doc();
+			},
+		});
+	}
 };
 
-// for backward compatibility: combine new and previous states
-extend_cscript(cur_frm.cscript, new erpnext.buying.PurchaseOrderController({ frm: cur_frm }));
-
-cur_frm.cscript.update_status = function (label, status) {
-	frappe.call({
-		method: "erpnext.buying.doctype.purchase_order.purchase_order.update_status",
-		args: { status: status, name: cur_frm.doc.name },
-		callback: function (r) {
-			cur_frm.set_value("status", status);
-			cur_frm.reload_doc();
-		},
-	});
-};
+frappe.ui.form.set_controller("Purchase Order", erpnext.buying.PurchaseOrderController);
 
 function set_schedule_date(frm) {
 	if (frm.doc.schedule_date) {

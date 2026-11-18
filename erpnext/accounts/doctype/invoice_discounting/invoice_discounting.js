@@ -24,15 +24,15 @@ frappe.ui.form.on("Invoice Discounting", {
 	},
 
 	filter_accounts: (fieldname, frm, addl_filters) => {
-		let filters = [
-			["company", "=", frm.doc.company],
-			["is_group", "=", 0],
-		];
-		if (addl_filters) {
-			filters = $.merge(filters, addl_filters);
-		}
-
 		frm.set_query(fieldname, () => {
+			let filters = [
+				["company", "=", frm.doc.company],
+				["is_group", "=", 0],
+			];
+			if (addl_filters) {
+				filters = $.merge(filters, addl_filters);
+			}
+
 			return { filters: filters };
 		});
 	},
@@ -61,14 +61,24 @@ frappe.ui.form.on("Invoice Discounting", {
 
 		if (frm.doc.docstatus === 1 && frm.doc.status !== "Settled") {
 			if (frm.doc.status == "Sanctioned") {
-				frm.add_custom_button(__("Disburse Loan"), function () {
-					frm.events.create_disbursement_entry(frm);
-				}).addClass("btn-primary");
+				frm.add_custom_button(
+					__("Disburse Loan"),
+					function () {
+						frm.events.create_disbursement_entry(frm);
+					},
+					null,
+					"primary"
+				);
 			}
 			if (frm.doc.status == "Disbursed") {
-				frm.add_custom_button(__("Close Loan"), function () {
-					frm.events.close_loan(frm);
-				}).addClass("btn-primary");
+				frm.add_custom_button(
+					__("Close Loan"),
+					function () {
+						frm.events.close_loan(frm);
+					},
+					null,
+					"primary"
+				);
 			}
 		}
 	},
@@ -134,8 +144,7 @@ frappe.ui.form.on("Invoice Discounting", {
 					fieldtype: "Currency",
 				},
 			],
-			primary_action: function () {
-				var data = d.get_values();
+			primary_action: function (data) {
 				data.company = frm.doc.company;
 
 				frappe.call({

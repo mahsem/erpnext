@@ -171,7 +171,7 @@ frappe.ui.form.on("Item", {
 		if (frappe.defaults.get_default("item_naming_by") != "Naming Series" || frm.doc.variant_of) {
 			frm.toggle_display("naming_series", false);
 		} else {
-			erpnext.toggle_naming_series();
+			erpnext.toggle_naming_series(frm);
 		}
 
 		frm.toggle_display(["standard_rate"], frappe.model.can_create("Item Price"));
@@ -315,15 +315,16 @@ frappe.ui.form.on("Item", {
 		erpnext.item.render_item_prices(frm);
 
 		frm.add_custom_button(__("Duplicate"), function () {
-			var new_item = frappe.model.copy_doc(frm.doc);
-			// Duplicate item could have different name, causing "copy paste" error.
-			if (new_item.item_name === new_item.item_code) {
-				new_item.item_name = null;
-			}
-			if (new_item.item_code === new_item.description || new_item.item_code === new_item.description) {
-				new_item.description = null;
-			}
-			frappe.set_route("Form", "Item", new_item.name);
+			// frm.copy_doc skips link triggers, so stock_uom does not clear the copied UOMs
+			frm.copy_doc((new_item) => {
+				// Duplicate item could have different name, causing "copy paste" error.
+				if (new_item.item_name === new_item.item_code) {
+					new_item.item_name = null;
+				}
+				if (new_item.item_code === new_item.description) {
+					new_item.description = null;
+				}
+			});
 		});
 
 		const stock_exists = frm.doc.__onload && frm.doc.__onload.stock_exists ? 1 : 0;
@@ -1134,10 +1135,7 @@ $.extend(erpnext.item, {
 			],
 		});
 
-		dialog.set_primary_action(__("Create"), function () {
-			var data = dialog.get_values();
-			if (!data) return;
-
+		dialog.set_primary_action(__("Create"), function (data) {
 			// call the server to make the variant
 			data.template = frm.doc.name;
 			frappe.call({
@@ -1476,15 +1474,13 @@ $.extend(erpnext.item, {
 			fields: fields,
 		});
 
-		d.set_primary_action(__("Create"), function () {
-			var args = d.get_values();
-			if (!args) return;
+		d.set_primary_action(__("Create"), function (args) {
 			frappe.call({
 				method: "erpnext.controllers.item_variant.get_variant",
 				btn: d.get_primary_btn(),
 				args: {
 					template: frm.doc.name,
-					args: d.get_values(),
+					args: args,
 				},
 				callback: function (r) {
 					// returns variant item
@@ -1511,7 +1507,7 @@ $.extend(erpnext.item, {
 							method: "erpnext.controllers.item_variant.create_variant",
 							args: {
 								item: frm.doc.name,
-								args: d.get_values(),
+								args: args,
 								use_template_image: args.use_template_image,
 							},
 							callback: function (r) {
@@ -1652,7 +1648,7 @@ frappe.tour["Item"] = [
 	},
 	{
 		fieldname: "include_item_in_manufacturing",
-		title: "Include Item in Manufacturing",
+		title: __("Include Item in Manufacturing"),
 		description: __(
 			"This is for raw material Items that'll be used to create finished goods. If the Item is an additional service like 'washing' that'll be used in the BOM, keep this unchecked."
 		),

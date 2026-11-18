@@ -68,7 +68,13 @@ frappe.ui.form.on("Stock Reconciliation", {
 	refresh: function (frm) {
 		erpnext.toggle_serial_batch_fields(frm);
 
-		if (frm.doc.docstatus < 1) {
+		// an Adjustment Entry's rows are the stock its items are reset to, made from the
+		// Stock Valuation Comparison report, so they are not edited here
+		const is_adjustment_entry = frm.doc.purpose === "Adjustment Entry";
+		frm.set_df_property("items", "read_only", is_adjustment_entry ? 1 : 0);
+		frm.set_df_property("purpose", "read_only", is_adjustment_entry ? 1 : 0);
+
+		if (frm.doc.docstatus < 1 && !is_adjustment_entry) {
 			frm.add_custom_button(__("Fetch Items from Warehouse"), function () {
 				frm.events.get_items(frm);
 			});
@@ -232,11 +238,20 @@ frappe.ui.form.on("Stock Reconciliation", {
 
 	set_amount_quantity: function (doc, cdt, cdn) {
 		var d = frappe.model.get_doc(cdt, cdn);
-		if (d.qty && d.valuation_rate) {
-			frappe.model.set_value(cdt, cdn, "amount", flt(d.qty) * flt(d.valuation_rate));
-			frappe.model.set_value(cdt, cdn, "quantity_difference", flt(d.qty) - flt(d.current_qty));
-			frappe.model.set_value(cdt, cdn, "amount_difference", flt(d.amount) - flt(d.current_amount));
-		}
+		// a blank qty or rate keeps the current one on save
+		const qty = d.qty ?? d.current_qty;
+		const rate = d.valuation_rate ?? d.current_valuation_rate;
+		const amount = flt(flt(qty) * flt(rate), precision("amount", d));
+		const current_amount = flt(
+			flt(d.current_qty) * flt(d.current_valuation_rate),
+			precision("current_amount", d)
+		);
+		frappe.model.set_value(cdt, cdn, {
+			amount: amount,
+			current_amount: current_amount,
+			quantity_difference: flt(flt(qty) - flt(d.current_qty), precision("qty", d)),
+			amount_difference: flt(amount - current_amount, precision("amount_difference", d)),
+		});
 	},
 	toggle_display_account_head: function (frm) {
 		frm.toggle_display(
@@ -381,4 +396,4 @@ erpnext.stock.StockReconciliation = class StockReconciliation extends erpnext.st
 	}
 };
 
-cur_frm.cscript = new erpnext.stock.StockReconciliation({ frm: cur_frm });
+frappe.ui.form.set_controller("Stock Reconciliation", erpnext.stock.StockReconciliation);

@@ -241,7 +241,11 @@ frappe.ui.form.on("Pick List", {
 		frm.clear_table("locations");
 		frm.trigger("add_get_items_button");
 	},
-	create_delivery(frm, doctype) {
+	async create_delivery(frm, doctype) {
+		if (!(await erpnext.utils.confirm_if_drafts_exist(frm.doc, doctype))) {
+			return;
+		}
+
 		frappe.model.open_mapped_doc({
 			method: "erpnext.stock.doctype.pick_list.mapper.create_delivery",
 			args: {
@@ -578,7 +582,7 @@ function get_holding_tree_rows_html(row) {
 		<tr>
 			${child_cell(frappe.utils.get_form_link("Pick List", d.pick_list, true))}
 			<td>${__(d.status)}</td>
-			<td>${frappe.utils.escape_html(d.batch_no || "")}</td>
+			<td>${frappe.utils.escape_html(d.batch_id || "")}</td>
 			<td class="text-right">${format_float(d.holding_qty)}</td>
 		</tr>`;
 	});

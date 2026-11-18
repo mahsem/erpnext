@@ -124,7 +124,10 @@ $.extend(erpnext.stock_reservation, {
 						in_list_view: 1,
 						get_query: () => {
 							return {
-								filters: [["Warehouse", "is_group", "!=", 1]],
+								filters: [
+									["Warehouse", "is_group", "!=", 1],
+									["Warehouse", "company", "=", frm.doc.company],
+								],
 							};
 						},
 					},
@@ -162,11 +165,10 @@ $.extend(erpnext.stock_reservation, {
 
 		frm.doc[parms.table_name].forEach((item) => {
 			let unreserved_qty =
-				(flt(item[qty_field]) -
-					(item.stock_reserved_qty
-						? flt(item.stock_reserved_qty)
-						: flt(item[dispatch_qty_field]) * flt(item.conversion_factor || 1))) /
-				flt(item.conversion_factor || 1);
+				flt(item[qty_field]) -
+				(item.stock_reserved_qty
+					? flt(item.stock_reserved_qty)
+					: flt(item[dispatch_qty_field]) * flt(item.conversion_factor || 1));
 
 			if (unreserved_qty > 0) {
 				let args = {
@@ -216,8 +218,11 @@ $.extend(erpnext.stock_reservation, {
 	unreserve_stock(frm) {
 		erpnext.stock_reservation.get_stock_reservation_entries(frm.doctype, frm.docname).then((r) => {
 			if (!r.exc && r.message) {
-				if (r.message.length > 0) {
-					erpnext.stock_reservation.prepare_for_cancel_sre_entries(frm, r.message);
+				const sre_entries = r.message.filter(
+					(sre) => erpnext.stock_reservation.get_held_qty(sre) > 0
+				);
+				if (sre_entries.length > 0) {
+					erpnext.stock_reservation.prepare_for_cancel_sre_entries(frm, sre_entries);
 				} else {
 					frappe.msgprint(__("No reserved stock to unreserve."));
 				}
@@ -253,12 +258,18 @@ $.extend(erpnext.stock_reservation, {
 				sre: sre.name,
 				item_code: sre.item_code,
 				warehouse: sre.warehouse,
-				qty: flt(sre.reserved_qty) - flt(sre.delivered_qty),
+				qty: erpnext.stock_reservation.get_held_qty(sre),
 			});
 		});
 
 		dialog.fields_dict.sr_entries.grid.refresh();
 		dialog.show();
+	},
+
+	get_held_qty(sre) {
+		return (
+			flt(sre.reserved_qty) - flt(sre.delivered_qty) - flt(sre.transferred_qty) - flt(sre.consumed_qty)
+		);
 	},
 
 	cancel_stock_reservation(dialog, frm) {

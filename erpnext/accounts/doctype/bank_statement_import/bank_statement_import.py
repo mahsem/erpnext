@@ -72,7 +72,7 @@ class BankStatementImport(DataImport):
 			self.template_warnings = ""
 
 		if self.import_file and not self.import_file.lower().endswith(".txt"):
-			self.validate_import_file()
+			self.get_importer()
 			self.validate_google_sheets_url()
 
 	def start_import(self):
@@ -92,6 +92,7 @@ class BankStatementImport(DataImport):
 
 		job_id = f"bank_statement_import::{self.name}"
 		if not is_job_enqueued(job_id):
+			# nosemgrep: frappe-semgrep-rules.rules.frappe-enqueue-without-after-commit -- user action, nothing written before the enqueue
 			enqueue(
 				start_import,
 				queue="default",
@@ -241,7 +242,7 @@ def get_preview_from_template(
 	return bsi.get_preview_from_template(import_file, google_sheets_url)
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def form_start_import(data_import: str):
 	bsi = frappe.get_doc("Bank Statement Import", data_import)
 	bsi.check_permission("write")
@@ -310,7 +311,12 @@ def start_import(data_import, bank_account, import_file_path, google_sheets_url,
 	finally:
 		frappe.flags.in_import = False
 
-	frappe.publish_realtime("data_import_refresh", {"data_import": data_import.name})
+	frappe.publish_realtime(
+		"data_import_refresh",
+		{"data_import": data_import.name},
+		doctype=data_import.doctype,
+		docname=data_import.name,
+	)
 
 
 def update_mapping_db(bank, template_options):
@@ -350,6 +356,7 @@ def write_files(import_file, data):
 	extension = extension.lstrip(".")
 
 	if extension == "csv":
+		# nosemgrep: frappe-semgrep-rules.rules.security.frappe-security-file-traversal -- path comes from a File document or upload
 		with open(full_file_path, "w", newline="") as file:
 			writer = csv.writer(file)
 			writer.writerows(data)
@@ -437,6 +444,11 @@ def get_import_logs(docname: str):
 
 @frappe.whitelist()
 def upload_bank_statement(**args):
+	# The only caller is the Bank Reconciliation Tool's "Upload Bank Statement" button, whose
+	# callback routes straight into a new Bank Statement Import form — so `create` is exactly the
+	# right to require, and both doctypes are System Manager only, which makes it loser-free.
+	frappe.has_permission("Bank Statement Import", "create", throw=True)
+
 	args = frappe._dict(args)
 	bsi = frappe.new_doc("Bank Statement Import")
 

@@ -2,6 +2,7 @@
  "actions": [],
  "autoname": "Prompt",
  "creation": "2019-03-13 16:23:46.636769",
+ "description": "A kind of stock entry, like material transfer or manufacture.",
  "doctype": "DocType",
  "editable_grid": 1,
  "engine": "InnoDB",
@@ -47,6 +48,7 @@
   }
  ],
  "grid_page_length": 50,
+ "icon": "tag",
  "links": [],
  "modified": "2026-08-28 14:00:00.000000",
  "modified_by": "Administrator",

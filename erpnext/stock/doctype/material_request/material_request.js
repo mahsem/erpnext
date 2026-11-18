@@ -340,7 +340,7 @@ frappe.ui.form.on("Material Request", {
 				];
 
 				if (overwrite_warehouse) {
-					allow_to_change_fields.push("description");
+					allow_to_change_fields.push("description", "manufacturer", "manufacturer_part_no");
 				}
 
 				if (!r.exc) {
@@ -408,7 +408,7 @@ frappe.ui.form.on("Material Request", {
 						} else {
 							erpnext.utils.remove_empty_first_row(frm, "items");
 							$.each(r.message, function (i, item) {
-								var d = frappe.model.add_child(cur_frm.doc, "Material Request Item", "items");
+								var d = frappe.model.add_child(frm.doc, "Material Request Item", "items");
 								d.item_code = item.item_code;
 								d.item_name = item.item_name;
 								d.description = item.description;
@@ -802,11 +802,10 @@ erpnext.buying.MaterialRequestController = class MaterialRequestController exten
 
 			if (doc.material_request_type == "Customer Provided") {
 				filters.customer = doc.customer;
-			} else if (
-				doc.material_request_type == "Purchase" ||
-				doc.material_request_type == "Subcontracting"
-			) {
+			} else if (doc.material_request_type == "Purchase") {
 				filters = { is_purchase_item: 1 };
+			} else if (doc.material_request_type == "Subcontracting") {
+				filters = { is_stock_item: 1, is_sub_contracted_item: 1 };
 			} else if (doc.material_request_type == "Manufacture") {
 				filters.include_item_in_manufacturing = 1;
 			}
@@ -840,8 +839,7 @@ erpnext.buying.MaterialRequestController = class MaterialRequestController exten
 	}
 };
 
-// for backward compatibility: combine new and previous states
-extend_cscript(cur_frm.cscript, new erpnext.buying.MaterialRequestController({ frm: cur_frm }));
+frappe.ui.form.set_controller("Material Request", erpnext.buying.MaterialRequestController);
 
 function set_schedule_date(frm) {
 	if (frm.doc.schedule_date) {

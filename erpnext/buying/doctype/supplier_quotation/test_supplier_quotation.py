@@ -12,7 +12,7 @@ from erpnext.buying.doctype.request_for_quotation.mapper import make_supplier_qu
 from erpnext.buying.doctype.request_for_quotation.test_request_for_quotation import (
 	make_request_for_quotation,
 )
-from erpnext.buying.doctype.supplier_quotation.mapper import make_purchase_order
+from erpnext.buying.doctype.supplier_quotation.mapper import make_purchase_order, make_quotation
 from erpnext.buying.doctype.supplier_quotation.supplier_quotation import set_expired_status
 from erpnext.controllers.accounts_controller import InvalidQtyError, update_child_qty_rate
 from erpnext.patches.v16_0.set_supplier_quotation_order_status import execute as set_order_status
@@ -47,6 +47,31 @@ class TestPurchaseOrder(ERPNextTestSuite):
 		sq.transaction_date = today()
 		sq.valid_till = add_days(today(), -1)
 		self.assertRaises(frappe.ValidationError, sq.insert)
+
+	def test_whole_number_stock_qty_must_not_be_fractional(self):
+		from erpnext.stock.doctype.item.test_item import make_item
+		from erpnext.utilities.transaction_base import UOMMustBeIntegerError
+
+		item = make_item(properties={"stock_uom": "Nos"}, uoms=[{"uom": "Kg", "conversion_factor": 0.5}])
+		sq = frappe.get_doc(
+			{
+				"doctype": "Supplier Quotation",
+				"company": "_Test Company",
+				"supplier": "_Test Supplier",
+				"items": [
+					{
+						"item_code": item.name,
+						"qty": 3,
+						"uom": "Kg",
+						"conversion_factor": 0.5,
+						"rate": 10,
+						"warehouse": "_Test Warehouse - _TC",
+					}
+				],
+			}
+		)
+
+		self.assertRaises(UOMMustBeIntegerError, sq.insert)
 
 	def test_set_expired_status_expires_only_submitted_past_quotations(self):
 		rfq = make_request_for_quotation()
@@ -89,14 +114,12 @@ class TestPurchaseOrder(ERPNextTestSuite):
 		partial_order.cancel()
 		self.assertEqual(
 			frappe.db.get_value("Supplier Quotation", partially_ordered.name, "status"),
-			"Submitted",
-		)
-
-		set_expired_status()
-		self.assertEqual(
-			frappe.db.get_value("Supplier Quotation", partially_ordered.name, "status"),
 			"Expired",
 		)
+		self.assertRaises(frappe.ValidationError, make_purchase_order, partially_ordered.name)
+
+		valid.db_set("valid_till", add_days(today(), -1))
+		self.assertRaises(frappe.ValidationError, make_purchase_order, valid.name)
 
 	def test_submit_and_cancel_updates_rfq_quote_status(self):
 		rfq = make_request_for_quotation()
@@ -161,31 +184,6 @@ class TestPurchaseOrder(ERPNextTestSuite):
 		supplier_quotation.reload()
 		self.assertEqual(supplier_quotation.status, "Ordered")
 		self.assertEqual(make_purchase_order(supplier_quotation.name).items, [])
-
-	def test_purchase_order_skips_fully_ordered_quotation_rows(self):
-		supplier_quotation = frappe.copy_doc(self.globalTestRecords["Supplier Quotation"][0])
-		supplier_quotation.append("items", {"item_code": "_Test Item 2", "qty": 3, "rate": 100})
-		supplier_quotation.submit()
-
-		first_order = make_purchase_order(
-			supplier_quotation.name,
-			args={"filtered_children": [supplier_quotation.items[0].name]},
-		)
-		first_order.items[0].schedule_date = add_days(today(), 1)
-		first_order.submit()
-
-		supplier_quotation.reload()
-		self.assertEqual(supplier_quotation.status, "Partially Ordered")
-
-		second_order = make_purchase_order(supplier_quotation.name)
-		self.assertEqual(len(second_order.items), 1)
-		self.assertEqual(second_order.items[0].item_code, "_Test Item 2")
-		self.assertEqual(second_order.items[0].qty, 3)
-
-		second_order.items[0].schedule_date = add_days(today(), 1)
-		second_order.submit()
-		supplier_quotation.reload()
-		self.assertEqual(supplier_quotation.status, "Ordered")
 
 	def test_purchase_order_cannot_exceed_supplier_quotation_qty(self):
 		supplier_quotation = frappe.copy_doc(self.globalTestRecords["Supplier Quotation"][0])
@@ -347,16 +345,38 @@ class TestPurchaseOrder(ERPNextTestSuite):
 			)
 			update_child_qty_rate("Supplier Quotation", trans_items, supplier_quotation.name)
 
-		update_qty(5)
+		update_qty(6)
 		supplier_quotation.reload()
 		self.assertEqual(supplier_quotation.items[0].conversion_factor, 2)
-		self.assertEqual(supplier_quotation.items[0].stock_qty, 10)
+		self.assertEqual(supplier_quotation.items[0].stock_qty, 12)
 
 		self.assertRaisesRegex(
 			frappe.ValidationError,
 			"Cannot reduce quantity than ordered or purchased quantity",
 			update_qty,
 			4,
+		)
+
+	def test_update_items_recomputes_order_status(self):
+		sq = frappe.copy_doc(self.globalTestRecords["Supplier Quotation"][0])
+		sq.submit()
+		self.make_order(sq, 4)
+		self.assertEqual(frappe.db.get_value("Supplier Quotation", sq.name, "status"), "Partially Ordered")
+
+		item = sq.items[0]
+		trans_items = json.dumps(
+			[{"item_code": item.item_code, "rate": item.rate, "qty": 4, "docname": item.name}]
+		)
+		update_child_qty_rate("Supplier Quotation", trans_items, sq.name)
+		self.assertEqual(frappe.db.get_value("Supplier Quotation", sq.name, "status"), "Ordered")
+
+		self.assertRaisesRegex(
+			frappe.ValidationError,
+			"because it is Ordered",
+			update_child_qty_rate,
+			"Supplier Quotation",
+			trans_items,
+			sq.name,
 		)
 
 	def test_update_supplier_quotation_child_remove_item(self):
@@ -424,6 +444,14 @@ class TestPurchaseOrder(ERPNextTestSuite):
 		sq.save()
 		self.assertEqual(sq.items[0].qty, 1)
 
+	def test_supplier_quotation_zero_qty_cannot_be_forced_by_the_client(self):
+		sq = frappe.copy_doc(self.globalTestRecords["Supplier Quotation"][0])
+		sq.items[0].qty = 0
+		sq.has_unit_price_items = 1
+
+		with self.assertRaises(InvalidQtyError):
+			sq.save()
+
 	def test_supplier_quotation_zero_qty(self):
 		"""
 		Test if RFQ with zero qty (Unit Price Item) is conditionally allowed.
@@ -455,6 +483,24 @@ class TestPurchaseOrder(ERPNextTestSuite):
 
 		po.insert()
 
+	def test_purchase_order_mapping_replaces_existing_taxes(self):
+		tax = {
+			"charge_type": "On Net Total",
+			"account_head": "_Test Account Excise Duty - _TC",
+			"description": "Excise Duty",
+			"rate": 10,
+			"cost_center": "_Test Cost Center - _TC",
+		}
+		sq = frappe.copy_doc(self.globalTestRecords["Supplier Quotation"][0])
+		sq.set("taxes", [tax])
+		sq.submit()
+		target = frappe.new_doc("Purchase Order", supplier=sq.supplier, company=sq.company)
+		target.append("taxes", tax)
+
+		po = make_purchase_order(sq.name, target.as_dict())
+
+		self.assertEqual(len(po.taxes), 1)
+
 	@ERPNextTestSuite.change_settings("Buying Settings", {"allow_zero_qty_in_supplier_quotation": 1})
 	def test_map_purchase_order_from_zero_qty_supplier_quotation(self):
 		sq = frappe.copy_doc(self.globalTestRecords["Supplier Quotation"][0])
@@ -465,3 +511,87 @@ class TestPurchaseOrder(ERPNextTestSuite):
 		self.assertEqual(len(po.get("items")), 1)
 		self.assertEqual(po.get("items")[0].qty, 0)
 		self.assertEqual(po.get("items")[0].item_code, sq.get("items")[0].item_code)
+
+	@ERPNextTestSuite.change_settings("Stock Settings", {"allow_to_edit_stock_uom_qty_for_purchase": 1})
+	def test_map_purchase_order_qty_in_quoted_uom(self):
+		from erpnext.stock.doctype.item.test_item import make_item
+
+		item = make_item(
+			properties={"stock_uom": "Kg"}, uoms=[{"uom": "Box", "conversion_factor": 0.333333333}]
+		)
+		sq = frappe.copy_doc(self.globalTestRecords["Supplier Quotation"][0])
+		sq.items[0].update({"item_code": item.name, "qty": 1, "uom": "Box", "conversion_factor": 0.333333333})
+		sq.submit()
+
+		po = make_purchase_order(sq.name)
+		self.assertEqual(po.items[0].qty, 1)
+
+	def test_quotation_drops_terms_not_applicable_to_selling(self):
+		quotation = self.make_quotation_with_terms(selling=0)
+		quotation.insert()
+
+		self.assertFalse(quotation.tc_name)
+		self.assertFalse(quotation.terms)
+
+	def test_quotation_keeps_terms_applicable_to_selling(self):
+		quotation = self.make_quotation_with_terms(selling=1)
+		quotation.insert()
+
+		self.assertEqual(quotation.tc_name, "_Test SQ Terms")
+		self.assertEqual(quotation.terms, "Delivery in 30 days")
+
+	def make_quotation_with_terms(self, selling):
+		frappe.get_doc(
+			doctype="Terms and Conditions",
+			title="_Test SQ Terms",
+			buying=1,
+			selling=selling,
+			terms="Delivery in 30 days",
+		).insert()
+		sq = frappe.copy_doc(self.globalTestRecords["Supplier Quotation"][0])
+		sq.tc_name = "_Test SQ Terms"
+		sq.terms = "Delivery in 30 days"
+		sq.submit()
+
+		quotation = make_quotation(sq.name)
+		quotation.party_name = "_Test Customer"
+		return quotation
+
+	def test_removing_quoted_rows_resets_rfq_quote_status(self):
+		rfq = make_request_for_quotation(do_not_submit=True)
+		rfq.append("items", dict(rfq.items[0].as_dict(), name=None, idx=None, item_code="_Test Item 2"))
+		rfq.submit()
+		supplier = rfq.suppliers[0].supplier
+		sq = make_supplier_quotation_from_rfq(rfq.name, for_supplier=supplier)
+		sq.submit()
+		self.assertEqual(rfq_quote_status(rfq.name, supplier), "Received")
+
+		row = sq.items[0]
+		trans_items = json.dumps(
+			[{"item_code": row.item_code, "rate": row.rate, "qty": row.qty, "docname": row.name}]
+		)
+		update_child_qty_rate("Supplier Quotation", trans_items, sq.name)
+
+		self.assertEqual(rfq_quote_status(rfq.name, supplier), "Pending")
+
+	def test_removing_only_rfq_row_resets_rfq_quote_status(self):
+		rfq = make_request_for_quotation()
+		supplier = rfq.suppliers[0].supplier
+		sq = make_supplier_quotation_from_rfq(rfq.name, for_supplier=supplier)
+		sq.append("items", {"item_code": "_Test Item 2", "qty": 1, "rate": 100})
+		sq.submit()
+		self.assertEqual(rfq_quote_status(rfq.name, supplier), "Received")
+
+		row = sq.items[1]
+		trans_items = json.dumps(
+			[{"item_code": row.item_code, "rate": row.rate, "qty": row.qty, "docname": row.name}]
+		)
+		update_child_qty_rate("Supplier Quotation", trans_items, sq.name)
+
+		self.assertEqual(rfq_quote_status(rfq.name, supplier), "Pending")
+
+
+def rfq_quote_status(rfq, supplier):
+	return frappe.db.get_value(
+		"Request for Quotation Supplier", {"parent": rfq, "supplier": supplier}, "quote_status"
+	)

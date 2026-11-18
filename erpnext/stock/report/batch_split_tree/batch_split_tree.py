@@ -3,10 +3,16 @@ from collections import defaultdict
 import frappe
 from frappe import _
 
+from erpnext.stock.doctype.company_restriction.company_restriction import (
+	get_allowed_masters_condition,
+	remove_restricted_masters,
+)
+from erpnext.stock.report.utils import prepare_serial_batch_report
+
 
 def execute(filters=None):
 	filters = frappe._dict(filters or {})
-	return get_columns(), get_data(filters)
+	return prepare_serial_batch_report(get_columns(), get_data(filters))
 
 
 def get_data(filters):
@@ -25,26 +31,53 @@ def get_data(filters):
 
 def get_root_batches(filters):
 	batch = frappe.qb.DocType("Batch")
-	child = frappe.qb.DocType("Batch").as_("child")
-
 	if filters.batch:
-		return [filters.batch]
+		query = frappe.qb.from_(batch).select(batch.name).where(batch.name == filters.batch)
+	else:
+		query = get_split_roots_query(batch, filters)
 
+	if condition := get_allowed_masters_condition(batch.item, "Item"):
+		query = query.where(condition)
+
+	return query.run(pluck=True)
+
+
+def get_split_roots_query(batch, filters):
+	child = frappe.qb.DocType("Batch").as_("child")
 	query = (
 		frappe.qb.from_(batch)
 		.inner_join(child)
 		.on(child.parent_batch == batch.name)
-		.select(batch.name)
+		.select(batch.name, batch.batch_id)
 		.distinct()
 		.where(batch.parent_batch.isnull())
 		.where(child.reference_name.isnotnull() & (child.reference_name != ""))
-		.orderby(batch.name)
+		.orderby(batch.batch_id)
 	)
 
 	if filters.item_code:
-		query = query.where(batch.item == filters.item_code)
+		ancestors = frappe.qb.Table("matching_batch_ancestors")
+		fields = [batch.name, batch.parent_batch, batch.reference_name]
+		seed = frappe.qb.from_(batch).select(*fields).where(batch.item == filters.item_code)
+		recursion = (
+			frappe.qb.from_(batch)
+			.inner_join(ancestors)
+			.on(batch.name == ancestors.parent_batch)
+			.select(*fields)
+			.where(ancestors.reference_name.isnotnull() & (ancestors.reference_name != ""))
+		)
+		if condition := get_allowed_masters_condition(batch.item, "Item"):
+			seed = seed.where(condition)
+			recursion = recursion.where(condition)
 
-	return query.run(pluck=True)
+		matching_batches = (
+			frappe.qb.with_(seed + recursion, "matching_batch_ancestors", recursive=True)
+			.from_(ancestors)
+			.select(ancestors.name)
+		)
+		query = query.where(batch.name.isin(matching_batches))
+
+	return query
 
 
 def get_children_map(roots):
@@ -77,7 +110,7 @@ def get_children_map(roots):
 	).run(as_dict=True)
 
 	children_map = defaultdict(dict)
-	for row in rows:
+	for row in remove_restricted_masters(rows, "item", "Item"):
 		children_map[row.parent_batch][row.name] = row
 
 	return children_map

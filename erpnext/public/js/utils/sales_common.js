@@ -66,7 +66,7 @@ erpnext.sales_common = {
 
 				if (this.frm.fields_dict.tc_name) {
 					this.frm.set_query("tc_name", function () {
-						return { filters: { selling: 1 } };
+						return { filters: { selling: 1, disabled: 0 } };
 					});
 				}
 
@@ -202,8 +202,23 @@ erpnext.sales_common = {
 				erpnext.utils.get_address_display(this.frm, "dispatch_address_name", "dispatch_address");
 			}
 
-			sales_partner() {
+			async sales_partner() {
 				this.apply_pricing_rule();
+				if (!this.frm.fields_dict.commission_rate) return;
+
+				const partner = this.frm.doc.sales_partner;
+				const rate = partner
+					? await frappe.xcall(
+							"erpnext.setup.doctype.sales_partner.sales_partner.get_commission_rate",
+							{
+								sales_partner: partner,
+							}
+					  )
+					: 0;
+				if (partner === this.frm.doc.sales_partner) {
+					await this.frm.set_value("commission_rate", rate);
+					this.calculate_commission();
+				}
 			}
 
 			campaign() {
@@ -274,8 +289,17 @@ erpnext.sales_common = {
 				}
 			}
 
-			sales_person(doc, cdt, cdn) {
-				var row = frappe.get_doc(cdt, cdn);
+			async sales_person(doc, cdt, cdn) {
+				const row = frappe.get_doc(cdt, cdn);
+				const sales_person = row.sales_person;
+				const commission_rate = sales_person
+					? await frappe.xcall(
+							"erpnext.setup.doctype.sales_person.sales_person.get_commission_rate",
+							{ sales_person }
+					  )
+					: 0;
+				if (row.sales_person !== sales_person) return;
+				await frappe.model.set_value(cdt, cdn, "commission_rate", flt(commission_rate));
 				this.calculate_incentive(row);
 				refresh_field("incentives", row.name, row.parentfield);
 			}
@@ -292,7 +316,8 @@ erpnext.sales_common = {
 						.filter(
 							(item) =>
 								item.parent_detail_docname === cdn ||
-								parseInt(item.parent_detail_docname) === locals[cdt][cdn].idx
+								(/^\d+$/.test(String(item.parent_detail_docname)) &&
+									Number(item.parent_detail_docname) === locals[cdt][cdn].idx)
 						)
 						.forEach((item) => {
 							frappe.model.set_value(
@@ -390,12 +415,10 @@ erpnext.sales_common = {
 			}
 
 			calculate_incentive(row) {
-				if (row.allocated_amount) {
-					row.incentives = flt(
-						(row.allocated_amount * row.commission_rate) / 100.0,
-						precision("incentives", row)
-					);
-				}
+				row.incentives = flt(
+					(flt(row.allocated_amount) * flt(row.commission_rate)) / 100.0,
+					precision("incentives", row)
+				);
 			}
 
 			set_dynamic_labels() {
@@ -610,37 +633,40 @@ erpnext.sales_common = {
 };
 
 erpnext.pre_sales = {
+	// also used by the Opportunity Kanban board
+	lost_reason_fields: function (doctype) {
+		return [
+			{
+				fieldtype: "Table MultiSelect",
+				label: __("Lost Reasons"),
+				fieldname: "lost_reason",
+				options:
+					doctype === "Opportunity"
+						? "Opportunity Lost Reason Detail"
+						: "Quotation Lost Reason Detail",
+				reqd: 1,
+			},
+			{
+				fieldtype: "Table MultiSelect",
+				label: __("Competitors"),
+				fieldname: "competitors",
+				options: "Competitor Detail",
+			},
+			{
+				fieldtype: "Small Text",
+				label: __("Detailed Reason"),
+				fieldname: "detailed_reason",
+			},
+		];
+	},
+
 	set_as_lost: function (doctype) {
 		frappe.ui.form.on(doctype, {
 			set_as_lost_dialog: function (frm) {
 				var dialog = new frappe.ui.Dialog({
 					title: __("Set as Lost"),
-					fields: [
-						{
-							fieldtype: "Table MultiSelect",
-							label: __("Lost Reasons"),
-							fieldname: "lost_reason",
-							options:
-								frm.doctype === "Opportunity"
-									? "Opportunity Lost Reason Detail"
-									: "Quotation Lost Reason Detail",
-							reqd: 1,
-						},
-						{
-							fieldtype: "Table MultiSelect",
-							label: __("Competitors"),
-							fieldname: "competitors",
-							options: "Competitor Detail",
-						},
-						{
-							fieldtype: "Small Text",
-							label: __("Detailed Reason"),
-							fieldname: "detailed_reason",
-						},
-					],
-					primary_action: function () {
-						let values = dialog.get_values();
-
+					fields: erpnext.pre_sales.lost_reason_fields(frm.doctype),
+					primary_action: function (values) {
 						frm.call({
 							doc: frm.doc,
 							method: "declare_enquiry_lost",

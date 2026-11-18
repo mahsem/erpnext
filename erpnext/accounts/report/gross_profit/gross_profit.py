@@ -5,21 +5,24 @@ from collections import OrderedDict
 
 import frappe
 from frappe import _, qb, scrub
+from frappe.desk.reportview import build_match_conditions
 from frappe.query_builder import Case, Order
-from frappe.query_builder.functions import Coalesce
+from frappe.query_builder.functions import Coalesce, NullIf
 from frappe.utils import cint, flt, formatdate
-from pypika.terms import ExistsCriterion
+from pypika.terms import Bracket, ExistsCriterion, LiteralValue
 
 from erpnext.accounts.doctype.accounting_dimension.accounting_dimension import (
 	get_accounting_dimensions,
-	get_dimension_with_children,
+	get_dimension_filter_condition,
+	get_dimension_filter_values,
 )
-from erpnext.accounts.report.financial_statements import get_cost_centers_with_children
-from erpnext.stock.report.stock_ledger.stock_ledger import get_item_group_condition
-from erpnext.stock.utils import get_incoming_rate
+from erpnext.accounts.report.utils import validate_date_range
+from erpnext.stock.utils import _get_incoming_rate
 
 
 def execute(filters=None):
+	validate_date_range(filters)
+
 	if not filters:
 		filters = frappe._dict()
 	filters.currency = frappe.get_cached_value("Company", filters.company, "default_currency")
@@ -257,6 +260,12 @@ def get_data_when_not_grouped_by_invoice(gross_profit_data, filters, group_wise_
 		row = [src.get(col) for col in group_columns] + [filters.currency]
 
 		data.append(row)
+
+	# an invoice shared by several sales persons is repeated under each of them
+	if filters.group_by == "Sales Person":
+		amounts = gross_profit_data.invoice_item_amounts.values()
+		total_base_amount = sum(flt(amount.base_amount) for amount in amounts)
+		total_buying_amount = sum(flt(amount.buying_amount) for amount in amounts)
 
 	total_gross_profit = flt(
 		total_base_amount + abs(total_buying_amount)
@@ -516,6 +525,7 @@ class GrossProfitGenerator:
 		self.get_delivery_notes()
 
 		self.load_product_bundle()
+		self.load_bundle_deliveries()
 		if filters.group_by == "Invoice":
 			self.group_items_by_invoice()
 
@@ -527,6 +537,7 @@ class GrossProfitGenerator:
 	def process(self):
 		self.grouped = {}
 		self.grouped_data = []
+		self.invoice_item_amounts = {}
 
 		self.currency_precision = cint(frappe.db.get_default("currency_precision")) or 3
 		self.float_precision = cint(frappe.db.get_default("float_precision")) or 2
@@ -570,7 +581,12 @@ class GrossProfitGenerator:
 								row.base_amount = packed_item.base_amount
 
 			# get buying amount
-			if row.is_debit_note:
+			if grouped_by_invoice and row.indent == 0.0:
+				row.buying_amount = buying_amount
+				row.base_amount = base_amount
+				buying_amount = 0
+				base_amount = 0
+			elif row.is_debit_note:
 				# Rate adjustment debit notes have no stock movement, so buying amount is zero
 				if not grouped_by_invoice:
 					row.qty = 0
@@ -580,14 +596,12 @@ class GrossProfitGenerator:
 					self.get_buying_amount_from_product_bundle(row, product_bundles[row.item_code]),
 					self.currency_precision,
 				)
+			elif row.item_row in self.bundle_deliveries:
+				row.buying_amount = flt(
+					self.get_buying_amount_from_delivered_bundles(row), self.currency_precision
+				)
 			else:
 				row.buying_amount = flt(self.get_buying_amount(row, row.item_code), self.currency_precision)
-
-			if grouped_by_invoice and row.indent == 0.0:
-				row.buying_amount = buying_amount
-				row.base_amount = base_amount
-				buying_amount = 0
-				base_amount = 0
 
 			# get buying rate
 			if flt(row.qty):
@@ -625,6 +639,9 @@ class GrossProfitGenerator:
 
 			# add to grouped
 			self.grouped.setdefault(row.get(scrub(self.filters.group_by)), []).append(row)
+			self.invoice_item_amounts[sales_invoice_item] = frappe._dict(
+				base_amount=row.base_amount, buying_amount=row.buying_amount
+			)
 
 		if self.grouped:
 			self.get_average_rate_based_on_group_by()
@@ -662,7 +679,7 @@ class GrossProfitGenerator:
 				for i, row in enumerate(self.grouped[key]):
 					invoice_portion = 0
 
-					if row.is_return:
+					if row.is_return or (row.invoice_portion is None and row.payment_amount is None):
 						invoice_portion = 100
 					elif row.invoice_portion:
 						invoice_portion = row.invoice_portion
@@ -734,7 +751,7 @@ class GrossProfitGenerator:
 	def get_returned_invoice_items(self):
 		si = frappe.qb.DocType("Sales Invoice")
 		si_item = frappe.qb.DocType("Sales Invoice Item")
-		returned_invoices = (
+		query = (
 			frappe.qb.from_(si)
 			.inner_join(si_item)
 			.on(si.name == si_item.parent)
@@ -751,8 +768,12 @@ class GrossProfitGenerator:
 				& (si.is_return == 1)
 				& si.posting_date.between(self.filters.from_date, self.filters.to_date)
 			)
-			.run(as_dict=1)
 		)
+
+		if self.filters.company:
+			query = query.where(si.company == self.filters.company)
+
+		returned_invoices = query.run(as_dict=1)
 
 		self.returned_invoices = frappe._dict()
 		self.legacy_returned_invoices = frappe._dict()
@@ -825,15 +846,42 @@ class GrossProfitGenerator:
 
 	def get_buying_amount_from_product_bundle(self, row, product_bundle):
 		buying_amount = 0.0
+		billed_share = self.get_billed_share_of_bundle(row)
 		for packed_item in product_bundle:
 			if packed_item.get("parent_detail_docname") == row.item_row:
 				packed_item_row = row.copy()
 				packed_item_row.warehouse = packed_item.warehouse
-				packed_item_row.qty = packed_item.total_qty * -1
+				packed_item_row.delivered_warehouse = None
+				packed_item_row.qty = packed_item.total_qty * -1 * billed_share
 				packed_item_row.serial_and_batch_bundle = packed_item.serial_and_batch_bundle
 				buying_amount += self.get_buying_amount(packed_item_row, packed_item.item_code)
 
 		return flt(buying_amount, self.currency_precision)
+
+	def get_buying_amount_from_delivered_bundles(self, row):
+		"""Buying amount of a bundle row delivered by Delivery Notes made from the invoice."""
+		buying_amount = 0.0
+		for delivered_row, packed_items in self.bundle_deliveries[row.item_row]:
+			delivery = row.copy()
+			delivery.update(
+				{
+					"dn_detail": delivered_row.name,
+					"delivery_note": delivered_row.parent,
+					"item_row": delivered_row.name,
+					"qty": delivered_row.stock_qty,
+				}
+			)
+			buying_amount += self.get_buying_amount_from_product_bundle(delivery, packed_items)
+
+		return buying_amount
+
+	def get_billed_share_of_bundle(self, row):
+		"""Share of the delivered bundle qty billed by this invoice row; packed item qty is the delivered qty."""
+		if not row.dn_detail:
+			return 1
+
+		delivered_qty = flt(frappe.db.get_value("Delivery Note Item", row.dn_detail, "stock_qty"))
+		return flt(row.qty) / delivered_qty if delivered_qty else 1
 
 	def calculate_buying_amount_from_sle(self, row, my_sle, parenttype, parent, item_row, item_code):
 		for i, sle in enumerate(my_sle):
@@ -866,7 +914,7 @@ class GrossProfitGenerator:
 			return flt(row.qty) * item_rate
 
 		else:
-			my_sle = self.get_stock_ledger_entries(item_code, row.warehouse)
+			my_sle = self.get_stock_ledger_entries(item_code, row.delivered_warehouse or row.warehouse)
 			if (row.update_stock or row.dn_detail) and my_sle:
 				parenttype = row.parenttype
 				parent = row.invoice or row.parent
@@ -924,6 +972,37 @@ class GrossProfitGenerator:
 		)
 
 		for row in buying_amounts:
+			if flt(row.stock_qty):
+				self.drop_ship_buying_rates[row.sales_order_item] = flt(row.buying_amount) / flt(
+					row.stock_qty
+				)
+
+		self.load_drop_ship_order_rates(sales_order_items - set(self.drop_ship_buying_rates))
+
+	def load_drop_ship_order_rates(self, sales_order_items):
+		"""Purchase Order rates for drop-ship rows the supplier has not invoiced yet."""
+		if not sales_order_items:
+			return
+
+		from frappe.query_builder.functions import Sum
+
+		purchase_order_item = frappe.qb.DocType("Purchase Order Item")
+		order_amounts = (
+			frappe.qb.from_(purchase_order_item)
+			.select(
+				purchase_order_item.sales_order_item,
+				Sum(purchase_order_item.base_net_amount).as_("buying_amount"),
+				Sum(purchase_order_item.stock_qty).as_("stock_qty"),
+			)
+			.where(
+				(purchase_order_item.sales_order_item.isin(sales_order_items))
+				& (purchase_order_item.docstatus == 1)
+			)
+			.groupby(purchase_order_item.sales_order_item)
+			.run(as_dict=True)
+		)
+
+		for row in order_amounts:
 			self.drop_ship_buying_rates[row.sales_order_item] = (
 				flt(row.buying_amount) / flt(row.stock_qty) if flt(row.stock_qty) else 0
 			)
@@ -935,13 +1014,16 @@ class GrossProfitGenerator:
 		return flt(row.qty) * self.drop_ship_buying_rates[row.so_detail]
 
 	def get_buying_amount_from_so_dn(self, sales_order, so_detail, item_code):
-		from frappe.query_builder.functions import Avg
+		from frappe.query_builder.functions import Sum
 
 		delivery_note_item = frappe.qb.DocType("Delivery Note Item")
 
 		query = (
 			frappe.qb.from_(delivery_note_item)
-			.select(Avg(delivery_note_item.incoming_rate))
+			.select(
+				Sum(delivery_note_item.stock_qty * delivery_note_item.incoming_rate)
+				/ NullIf(Sum(delivery_note_item.stock_qty), 0)
+			)
 			.where(delivery_note_item.docstatus == 1)
 			.where(delivery_note_item.item_code == item_code)
 			.where(delivery_note_item.against_sales_order == sales_order)
@@ -954,7 +1036,7 @@ class GrossProfitGenerator:
 
 	def get_average_buying_rate(self, row, item_code):
 		args = row
-		key = (item_code, row.warehouse)
+		key = (item_code, row.warehouse, row.posting_date, row.posting_time, row.serial_and_batch_bundle)
 		if key not in self.average_buying_rate:
 			args.update(
 				{
@@ -969,7 +1051,7 @@ class GrossProfitGenerator:
 			if row.serial_and_batch_bundle:
 				args.update({"serial_and_batch_bundle": row.serial_and_batch_bundle})
 
-			average_buying_rate = get_incoming_rate(args)
+			average_buying_rate = _get_incoming_rate(args)
 			self.average_buying_rate[key] = flt(average_buying_rate)
 
 		return self.average_buying_rate[key]
@@ -983,7 +1065,7 @@ class GrossProfitGenerator:
 			.inner_join(purchase_invoice)
 			.on(purchase_invoice.name == purchase_invoice_item.parent)
 			.select(
-				purchase_invoice_item.base_rate / purchase_invoice_item.conversion_factor,
+				purchase_invoice_item.base_net_rate / purchase_invoice_item.conversion_factor,
 			)
 			.where(purchase_invoice.docstatus == 1)
 			.where(purchase_invoice.posting_date <= self.filters.to_date)
@@ -1040,6 +1122,7 @@ class GrossProfitGenerator:
 		Item = frappe.qb.DocType("Item")
 		SalesTeam = frappe.qb.DocType("Sales Team")
 		PaymentSchedule = frappe.qb.DocType("Payment Schedule")
+		DeliveryNoteItem = frappe.qb.DocType("Delivery Note Item")
 
 		query = (
 			frappe.qb.from_(SalesInvoice)
@@ -1047,17 +1130,23 @@ class GrossProfitGenerator:
 			.on(SalesInvoiceItem.parent == SalesInvoice.name)
 			.join(Item)
 			.on(Item.name == SalesInvoiceItem.item_code)
+			.left_join(DeliveryNoteItem)
+			.on(DeliveryNoteItem.name == SalesInvoiceItem.dn_detail)
 			.where((SalesInvoice.docstatus == 1) & (SalesInvoice.is_opening != "Yes"))
 		)
 
 		query = self.apply_common_filters(query, SalesInvoice, SalesInvoiceItem, SalesTeam, Item)
+
+		if match_conditions := build_match_conditions("Sales Invoice"):
+			query = query.where(Bracket(LiteralValue(match_conditions)))
 
 		query = query.select(
 			SalesInvoiceItem.parenttype,
 			SalesInvoiceItem.parent,
 			SalesInvoice.posting_date,
 			SalesInvoice.posting_time,
-			SalesInvoice.project,
+			Coalesce(NullIf(SalesInvoiceItem.project, ""), SalesInvoice.project).as_("project"),
+			SalesInvoice.project.as_("invoice_project"),
 			SalesInvoice.update_stock,
 			SalesInvoice.customer,
 			SalesInvoice.customer_group,
@@ -1069,6 +1158,7 @@ class GrossProfitGenerator:
 			SalesInvoiceItem.item_name,
 			SalesInvoiceItem.description,
 			SalesInvoiceItem.warehouse,
+			DeliveryNoteItem.warehouse.as_("delivered_warehouse"),
 			SalesInvoiceItem.item_group,
 			SalesInvoiceItem.brand,
 			SalesInvoiceItem.so_detail,
@@ -1127,19 +1217,26 @@ class GrossProfitGenerator:
 			query = query.where(SalesInvoice.posting_date <= self.filters.to_date)
 
 		if self.filters.item_group:
-			query = query.where(get_item_group_condition(self.filters.item_group, Item))
+			query = query.where(
+				get_dimension_filter_condition(Item.item_group, self.filters.item_group, "Item Group")
+			)
 
 		if self.filters.sales_person:
-			query = query.where(
-				ExistsCriterion(
-					frappe.qb.from_(SalesTeam)
-					.select(1)
-					.where(
-						(SalesTeam.parent == SalesInvoice.name)
-						& (SalesTeam.sales_person == self.filters.sales_person)
+			sales_team = (
+				frappe.qb.from_(SalesTeam)
+				.select(1)
+				.where((SalesTeam.parent == SalesInvoice.name) & (SalesTeam.parenttype == "Sales Invoice"))
+			)
+			condition = ExistsCriterion(
+				sales_team.where(
+					get_dimension_filter_condition(
+						SalesTeam.sales_person, self.filters.sales_person, "Sales Person"
 					)
 				)
 			)
+			if get_dimension_filter_values(self.filters.sales_person)[1]:
+				condition |= ~ExistsCriterion(sales_team)
+			query = query.where(condition)
 
 		if self.filters.sales_invoice:
 			query = query.where(SalesInvoice.name == self.filters.sales_invoice)
@@ -1148,28 +1245,34 @@ class GrossProfitGenerator:
 			query = query.where(SalesInvoiceItem.item_code == self.filters.item_code)
 
 		if self.filters.cost_center:
-			self.filters.cost_center = frappe.parse_json(self.filters.get("cost_center"))
-			self.filters.cost_center = get_cost_centers_with_children(self.filters.cost_center)
-			query = query.where(SalesInvoiceItem.cost_center.isin(self.filters.cost_center))
+			query = query.where(
+				get_dimension_filter_condition(
+					SalesInvoiceItem.cost_center, self.filters.cost_center, "Cost Center"
+				)
+			)
 
 		if self.filters.project:
-			self.filters.project = frappe.parse_json(self.filters.get("project"))
-			query = query.where(SalesInvoiceItem.project.isin(self.filters.project))
+			query = query.where(
+				get_dimension_filter_condition(SalesInvoiceItem.project, self.filters.project, "Project")
+			)
 
 		for dim in get_accounting_dimensions(as_list=False) or []:
-			if self.filters.get(dim.fieldname):
-				if frappe.get_cached_value("DocType", dim.document_type, "is_tree"):
-					self.filters[dim.fieldname] = get_dimension_with_children(
-						dim.document_type, self.filters.get(dim.fieldname)
+			dimension_filter = self.filters.get(f"accounting_dimension_{dim.fieldname}")
+			if dimension_filter is None and dim.fieldname != "sales_invoice":
+				dimension_filter = self.filters.get(dim.fieldname)
+			if dimension_filter:
+				query = query.where(
+					get_dimension_filter_condition(
+						SalesInvoiceItem[dim.fieldname],
+						dimension_filter,
+						dim.document_type,
 					)
-				query = query.where(SalesInvoiceItem[dim.fieldname].isin(self.filters[dim.fieldname]))
+				)
 
 		if self.filters.warehouse:
-			lft, rgt = frappe.db.get_value("Warehouse", self.filters.warehouse, ["lft", "rgt"])
-			WH = frappe.qb.DocType("Warehouse")
 			query = query.where(
-				SalesInvoiceItem.warehouse.isin(
-					frappe.qb.from_(WH).select(WH.name).where((WH.lft >= lft) & (WH.rgt <= rgt))
+				get_dimension_filter_condition(
+					SalesInvoiceItem.warehouse, self.filters.warehouse, "Warehouse"
 				)
 			)
 
@@ -1242,7 +1345,7 @@ class GrossProfitGenerator:
 				"parent": None,
 				"posting_date": row.posting_date,
 				"posting_time": row.posting_time,
-				"project": row.project,
+				"project": row.invoice_project,
 				"update_stock": row.update_stock,
 				"is_debit_note": row.is_debit_note,
 				"customer": row.customer,
@@ -1354,6 +1457,32 @@ class GrossProfitGenerator:
 			self.product_bundles.setdefault(d.parenttype, frappe._dict()).setdefault(
 				d.parent, frappe._dict()
 			).setdefault(d.parent_item, []).append(d)
+
+	def load_bundle_deliveries(self):
+		"""Bundle rows of Delivery Notes made from the invoices, keyed by the invoice row."""
+		self.bundle_deliveries = {}
+		invoices = {row.parent for row in self.si_list}
+		if not invoices:
+			return
+
+		dni = qb.DocType("Delivery Note Item")
+		delivered_rows = (
+			qb.from_(dni)
+			.select(dni.name, dni.parent, dni.item_code, dni.stock_qty, dni.si_detail)
+			.where(
+				(dni.docstatus == 1) & dni.against_sales_invoice.isin(invoices) & dni.si_detail.isnotnull()
+			)
+			.run(as_dict=True)
+		)
+
+		delivery_note_bundles = self.product_bundles.get("Delivery Note", {})
+		for delivered_row in delivered_rows:
+			if packed_items := delivery_note_bundles.get(delivered_row.parent, {}).get(
+				delivered_row.item_code
+			):
+				self.bundle_deliveries.setdefault(delivered_row.si_detail, []).append(
+					(delivered_row, packed_items)
+				)
 
 	def load_non_stock_items(self):
 		self.non_stock_items = frappe.get_all("Item", filters={"is_stock_item": 0}, pluck="name")

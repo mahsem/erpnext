@@ -6,7 +6,8 @@ import json
 
 import frappe
 from frappe import _
-from frappe.utils import cint, cstr, flt, getdate
+from frappe.query_builder.functions import Sum
+from frappe.utils import cint, flt, getdate
 
 from erpnext.stock.doctype.item.item import get_last_purchase_details, validate_end_of_life
 
@@ -14,7 +15,9 @@ from erpnext.stock.doctype.item.item import get_last_purchase_details, validate_
 def update_last_purchase_rate(doc, is_submit) -> None:
 	"""updates last_purchase_rate in item table for each item"""
 
-	if doc.get("is_internal_supplier"):
+	if doc.get("is_internal_supplier") or frappe.db.get_single_value(
+		"Buying Settings", "disable_last_purchase_rate"
+	):
 		return
 
 	this_purchase_date = getdate(doc.get("posting_date") or doc.get("transaction_date"))
@@ -43,23 +46,35 @@ def update_last_purchase_rate(doc, is_submit) -> None:
 				frappe.throw(_("UOM Conversion factor is required in row {0}").format(d.idx))
 
 		# update last purchsae rate
-		frappe.db.set_value("Item", d.item_code, "last_purchase_rate", flt(last_purchase_rate))
+		frappe.db.set_value(
+			"Item", d.item_code, "last_purchase_rate", flt(last_purchase_rate), update_modified=False
+		)
 
 
 def validate_for_items(doc) -> None:
-	items = []
 	for d in doc.get("items"):
 		set_stock_levels(row=d)  # update with latest quantities
 		item = validate_item_and_get_basic_data(row=d)
 		validate_stock_item_warehouse(row=d, item=item)
 		validate_end_of_life(d.item_code, item.end_of_life, item.disabled)
 
-		items.append(cstr(d.item_code))
+	validate_duplicate_items(doc)
 
-	if (
-		items
-		and len(items) != len(set(items))
-		and not cint(frappe.db.get_single_value("Buying Settings", "allow_multiple_items") or 0)
+
+def validate_duplicate_items(doc) -> None:
+	rows = [
+		(
+			row.item_code,
+			row.get("purchase_receipt"),
+			row.get("purchase_order"),
+			row.get("material_request"),
+			row.get("supplier_quotation"),
+		)
+		for row in doc.get("items")
+		if row.item_code
+	]
+	if len(rows) != len(set(rows)) and not cint(
+		frappe.db.get_single_value("Buying Settings", "allow_multiple_items")
 	):
 		frappe.throw(_("Same item cannot be entered multiple times."))
 
@@ -187,3 +202,21 @@ def get_linked_material_requests(items: str | list):
 			mr_list.extend(result)
 
 	return mr_list
+
+
+def get_qty_to_order(rows, link_field: str) -> dict:
+	"""Qty of each row left to order, in its UOM, from the unrounded stock qty of submitted Purchase Orders."""
+	po_item = frappe.qb.DocType("Purchase Order Item")
+	ordered_stock_qty = dict(
+		frappe.qb.from_(po_item)
+		.select(po_item[link_field], Sum(po_item.qty * po_item.conversion_factor))
+		.where((po_item.docstatus == 1) & po_item[link_field].isin([row.name for row in rows]))
+		.groupby(po_item[link_field])
+		.run()
+	)
+	return {
+		row.name: flt(
+			row.qty - flt(ordered_stock_qty.get(row.name)) / row.conversion_factor, row.precision("qty")
+		)
+		for row in rows
+	}

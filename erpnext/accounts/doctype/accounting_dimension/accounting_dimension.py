@@ -16,6 +16,9 @@ from erpnext.accounts.doctype.repost_accounting_ledger.repost_accounting_ledger 
 	get_allowed_types_from_settings,
 )
 
+# Document names cannot contain ">", so this cannot collide with a dimension value.
+BLANK_ACCOUNTING_DIMENSION = "__blank__>"
+
 
 class AccountingDimension(Document):
 	# begin: auto-generated types
@@ -43,7 +46,8 @@ class AccountingDimension(Document):
 	def validate(self):
 		self.validate_doctype()
 		validate_column_name(self.fieldname)
-		self.validate_fieldname_conflict()
+		if self.has_value_changed("fieldname"):
+			self.validate_fieldname_conflict()
 		self.validate_dimension_defaults()
 
 	def validate_doctype(self):
@@ -219,12 +223,20 @@ def delete_accounting_dimension(doc):
 	budget_against_property.value = "\nCost Center\nProject\n" + "\n".join(value_list)
 	budget_against_property.save()
 
+	for name in frappe.get_all(
+		"Accounting Dimension Filter", filters={"accounting_dimension": doc.document_type}, pluck="name"
+	):
+		frappe.delete_doc("Accounting Dimension Filter", name, ignore_permissions=True)
+
 	for doctype in doclist:
 		frappe.clear_cache(doctype=doctype)
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def disable_dimension(doc: str):
+	# toggle_disabling rewrites a Custom Field site-wide, so demand the write that configures dimensions
+	frappe.has_permission("Accounting Dimension", "write", throw=True)
+
 	if frappe.in_test:
 		toggle_disabling(doc=doc)
 	else:
@@ -303,6 +315,54 @@ def get_dimension_with_children(doctype, dimensions):
 		all_dimensions += [c.name for c in children]
 
 	return all_dimensions
+
+
+def get_dimension_filter_values(values, dimension_doctype=None):
+	if isinstance(values, str):
+		try:
+			parsed_values = json.loads(values)
+		except json.JSONDecodeError:
+			pass
+		else:
+			if isinstance(parsed_values, list):
+				values = parsed_values
+
+	if values is None:
+		values = []
+	elif not isinstance(values, list | tuple):
+		values = [values]
+
+	include_blank = BLANK_ACCOUNTING_DIMENSION in values
+	values = [value for value in values if value != BLANK_ACCOUNTING_DIMENSION]
+
+	if values and dimension_doctype and frappe.get_cached_value("DocType", dimension_doctype, "is_tree"):
+		values = get_dimension_with_children(dimension_doctype, values)
+
+	return values, include_blank
+
+
+def get_dimension_filter_condition(field, values, dimension_doctype=None):
+	values, include_blank = get_dimension_filter_values(values, dimension_doctype)
+	condition = field.isin(values) if values else None
+
+	if include_blank:
+		blank_condition = field.isnull() | (field == "")
+		condition = condition | blank_condition if condition else blank_condition
+
+	return condition
+
+
+def get_dimension_filter_sql_condition(fieldname, values, dimension_doctype=None):
+	values, include_blank = get_dimension_filter_values(values, dimension_doctype)
+	parts = []
+
+	if values:
+		parts.append(f"{fieldname} IN ({', '.join(['?'] * len(values))})")
+
+	if include_blank:
+		parts.append(f"({fieldname} IS NULL OR {fieldname} = '')")
+
+	return f"({' OR '.join(parts)})" if parts else None, values
 
 
 @frappe.whitelist()

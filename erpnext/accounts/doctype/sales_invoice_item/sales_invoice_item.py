@@ -6,7 +6,7 @@ import frappe
 from frappe import _
 from frappe.model.document import Document
 
-from erpnext.assets.doctype.asset.depreciation import get_disposal_account_and_cost_center
+from erpnext.assets.doctype.asset.depreciation import _get_disposal_account_and_cost_center
 
 
 class SalesInvoiceItem(Document):
@@ -25,6 +25,8 @@ class SalesInvoiceItem(Document):
 		amount: DF.Currency
 		apply_tds: DF.Check
 		asset: DF.Link | None
+		asset_gross_value: DF.Currency
+		asset_value_after_depreciation: DF.Currency
 		barcode: DF.Data | None
 		base_amount: DF.Currency
 		base_net_amount: DF.Currency
@@ -63,6 +65,7 @@ class SalesInvoiceItem(Document):
 		item_name: DF.Data
 		item_tax_rate: DF.SmallText | None
 		item_tax_template: DF.Link | None
+		mapped_additional_discount_amount: DF.Currency
 		margin_rate_or_amount: DF.Float
 		margin_type: DF.Literal["", "Percentage", "Amount"]
 		net_amount: DF.Currency
@@ -119,7 +122,7 @@ class SalesInvoiceItem(Document):
 		if not self.is_fixed_asset:
 			return
 
-		disposal_account, depreciation_cost_center = get_disposal_account_and_cost_center(company)
+		disposal_account, depreciation_cost_center = _get_disposal_account_and_cost_center(company)
 
 		self.income_account = disposal_account
 		if not self.cost_center:

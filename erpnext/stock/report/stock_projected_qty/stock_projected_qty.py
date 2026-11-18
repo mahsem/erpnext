@@ -9,6 +9,7 @@ from frappe.utils.nestedset import get_descendants_of
 from pypika.terms import ExistsCriterion
 
 from erpnext.accounts.doctype.pos_invoice.pos_invoice import get_pos_reserved_qty
+from erpnext.stock.doctype.company_restriction.company_restriction import get_allowed_warehouses_condition
 from erpnext.stock.utils import (
 	is_reposting_item_valuation_in_progress,
 	update_included_uom_in_report,
@@ -49,13 +50,13 @@ def execute(filters=None):
 				re_order_level = d.warehouse_reorder_level
 				re_order_qty = d.warehouse_reorder_qty
 
-		shortage_qty = 0
-		if (re_order_level or re_order_qty) and re_order_level > bin.projected_qty:
-			shortage_qty = re_order_level - flt(bin.projected_qty)
-
 		reserved_qty_for_pos = get_pos_reserved_qty(bin.item_code, bin.warehouse)
 		if reserved_qty_for_pos:
 			bin.projected_qty -= reserved_qty_for_pos
+
+		shortage_qty = 0
+		if (re_order_level or re_order_qty) and re_order_level > bin.projected_qty:
+			shortage_qty = re_order_level - flt(bin.projected_qty)
 
 		data.append(
 			[
@@ -282,6 +283,9 @@ def get_bin_list(filters):
 					)
 				)
 			)
+
+	if condition := get_allowed_warehouses_condition(bin.warehouse):
+		query = query.where(condition)
 
 	bin_list = query.run(as_dict=True)
 

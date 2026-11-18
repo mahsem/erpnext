@@ -15,11 +15,17 @@ from frappe.utils import cint, flt
 import erpnext
 from erpnext import is_perpetual_inventory_enabled
 from erpnext.controllers.taxes_and_totals import init_landed_taxes_and_totals
+from erpnext.projects.doctype.project.project import update_purchase_cost
 from erpnext.stock.doctype.serial_no.serial_no import get_serial_nos
+from erpnext.stock.serial_batch_identity import SerialBatchIdentity
+from erpnext.utilities.query import get_match_conditions_qb
 
 
 class IncorrectCompanyValidationError(frappe.ValidationError):
 	pass
+
+
+RECEIPT_DOCUMENT_TYPES = ("Purchase Invoice", "Purchase Receipt", "Subcontracting Receipt", "Stock Entry")
 
 
 class LandedCostVoucher(Document):
@@ -60,6 +66,7 @@ class LandedCostVoucher(Document):
 		self.set("items", [])
 		for pr in self.get("purchase_receipts"):
 			if pr.receipt_document_type and pr.receipt_document:
+				check_receipt_document_access(pr.receipt_document_type, pr.receipt_document)
 				pr_items = get_pr_items(pr)
 
 				for d in pr_items:
@@ -67,7 +74,7 @@ class LandedCostVoucher(Document):
 					item.item_code = d.item_code
 					item.description = d.description
 					item.qty = d.qty
-					item.rate = d.get("base_rate") or d.get("rate")
+					item.rate = d.base_rate
 					item.cost_center = d.cost_center or erpnext.get_default_cost_center(self.company)
 					item.amount = d.base_amount
 					item.receipt_document_type = pr.receipt_document_type
@@ -91,6 +98,7 @@ class LandedCostVoucher(Document):
 
 		self.set_applicable_charges_on_item()
 		self.set_total_vendor_invoices_cost()
+		self.validate_vendor_invoice_claims()
 		# Runs last: needs the items table populated by get_items_from_purchase_receipts
 		self.validate_mandatory_dimensions()
 
@@ -164,6 +172,16 @@ class LandedCostVoucher(Document):
 					)
 					frappe.throw(msg, title=_("Incorrect Invoice"))
 
+			if d.receipt_document_type == "Stock Entry":
+				purpose = frappe.get_cached_value(d.receipt_document_type, d.receipt_document, "purpose")
+				if purpose not in ("Manufacture", "Repack"):
+					frappe.throw(
+						_(
+							"Row {0}: Landed Cost Voucher can only be made against a Manufacture or Repack Stock Entry. Stock Entry {1} is a {2}."
+						).format(d.idx, frappe.bold(d.receipt_document), _(purpose)),
+						title=_("Incorrect Stock Entry"),
+					)
+
 			receipt_documents.append(d.receipt_document)
 
 		for item in self.get("items"):
@@ -183,6 +201,7 @@ class LandedCostVoucher(Document):
 				)
 
 	def validate_expense_accounts(self):
+		self.validate_charge_account_types()
 		if not is_perpetual_inventory_enabled(self.company):
 			return
 
@@ -201,6 +220,22 @@ class LandedCostVoucher(Document):
 					),
 					title=_("Incorrect Account"),
 					exc=IncorrectCompanyValidationError,
+				)
+
+	def validate_charge_account_types(self):
+		for row in self.taxes:
+			if not row.expense_account:
+				continue
+
+			account_type, is_group = frappe.get_cached_value(
+				"Account", row.expense_account, ["account_type", "is_group"]
+			)
+			if account_type == "Stock" or is_group:
+				frappe.throw(
+					_("Row {0}: Account {1} cannot be used for landed cost charges").format(
+						row.idx, frappe.bold(row.expense_account)
+					),
+					title=_("Incorrect Account"),
 				)
 
 	def validate_mandatory_dimensions(self):
@@ -306,33 +341,36 @@ class LandedCostVoucher(Document):
 
 	def set_applicable_charges_on_item(self):
 		if self.get("taxes") and self.distribute_charges_based_on != "Distribute Manually":
-			total_item_cost = 0.0
-			total_charges = 0.0
-			item_count = 0
+			items = self.get("items")
 			based_on_field = frappe.scrub(self.distribute_charges_based_on)
 
-			for item in self.get("items"):
-				total_item_cost += item.get(based_on_field)
+			total_item_cost = sum(flt(item.get(based_on_field)) for item in items)
+			if items:
+				total_item_cost = flt(total_item_cost, items[0].precision(based_on_field))
 
-			for item in self.get("items"):
-				if not total_item_cost and not item.get(based_on_field):
-					frappe.throw(
-						_(
-							"It's not possible to distribute charges equally when total amount is zero, please set 'Distribute Charges Based On' as 'Quantity'"
-						)
+			if not total_item_cost:
+				frappe.throw(
+					_("Total {0} of all items is zero. Set 'Distribute Charges Based On' to {1}.").format(
+						self.distribute_charges_based_on,
+						_("Qty") if based_on_field == "amount" else _("Amount"),
 					)
-
-				item.applicable_charges = flt(
-					flt(item.get(based_on_field))
-					* (flt(self.total_taxes_and_charges) / flt(total_item_cost)),
-					item.precision("applicable_charges"),
 				)
-				total_charges += item.applicable_charges
-				item_count += 1
 
-			if total_charges != self.total_taxes_and_charges:
-				diff = self.total_taxes_and_charges - total_charges
-				self.get("items")[item_count - 1].applicable_charges += diff
+			self.distribute_charges(items, based_on_field, total_item_cost)
+
+	def distribute_charges(self, items, based_on_field, total_item_cost):
+		precision = items[0].precision("applicable_charges")
+		charges_per_unit = flt(self.total_taxes_and_charges) / flt(total_item_cost)
+		for item in items:
+			item.applicable_charges = flt(flt(item.get(based_on_field)) * charges_per_unit, precision)
+
+		diff = flt(self.total_taxes_and_charges) - sum(flt(item.applicable_charges) for item in items)
+		absorb_rounding_difference(
+			self.get_rows_following_the_basis_total(),
+			flt(diff, precision),
+			precision,
+			self.total_taxes_and_charges,
+		)
 
 	def validate_applicable_charges_for_item(self):
 		based_on = self.distribute_charges_based_on.lower()
@@ -360,17 +398,48 @@ class LandedCostVoucher(Document):
 		diff = flt(self.total_taxes_and_charges) - flt(total_applicable_charges)
 		diff = flt(diff, precision)
 
-		if abs(diff) < (2.0 / (10**precision)):
-			self.items[-1].applicable_charges += diff
-		else:
+		if abs(diff) >= (2.0 / (10**precision)):
 			frappe.throw(
 				_(
 					"Total Applicable Charges in Purchase Receipt Items table must be same as Total Taxes and Charges"
 				)
 			)
 
+		absorb_rounding_difference(
+			self.get_rows_following_the_basis_total(), diff, precision, self.total_taxes_and_charges
+		)
+		self.validate_charges_follow_total_sign()
+
+	def get_charge_sign_basis(self):
+		based_on = frappe.scrub(self.distribute_charges_based_on)
+		if based_on == "distribute_manually":
+			based_on = "amount"
+
+		basis_sign = -1 if sum(flt(row.get(based_on)) for row in self.get("items")) < 0 else 1
+		return based_on, basis_sign
+
+	def get_rows_following_the_basis_total(self):
+		based_on, basis_sign = self.get_charge_sign_basis()
+		return [row for row in self.get("items") if flt(row.get(based_on)) * basis_sign >= 0]
+
+	def validate_charges_follow_total_sign(self):
+		total_sign = -1 if flt(self.total_taxes_and_charges) < 0 else 1
+		based_on, basis_sign = self.get_charge_sign_basis()
+		for row in self.get("items"):
+			expected_sign = total_sign * (-1 if flt(row.get(based_on)) * basis_sign < 0 else 1)
+			if flt(row.applicable_charges) * expected_sign >= 0:
+				continue
+
+			message = (
+				_("Row {0}: Applicable Charges for Item {1} cannot be negative")
+				if expected_sign > 0
+				else _("Row {0}: Applicable Charges for Item {1} cannot be positive")
+			)
+			frappe.throw(message.format(row.idx, frappe.bold(row.item_code)))
+
 	@frappe.whitelist()
 	def get_receipt_document_details(self, receipt_document_type: str, receipt_document: str):
+		check_receipt_document_access(receipt_document_type, receipt_document)
 		if receipt_document_type in [
 			"Purchase Invoice",
 			"Purchase Receipt",
@@ -395,19 +464,50 @@ class LandedCostVoucher(Document):
 		self.validate_applicable_charges_for_item()
 		self.update_landed_cost()
 		self.update_claimed_landed_cost()
+		self.update_project_purchase_cost()
 
 	def on_cancel(self):
 		self.update_landed_cost()
 		self.update_claimed_landed_cost()
+		self.update_project_purchase_cost()
+
+	def update_project_purchase_cost(self):
+		if frappe.db.get_single_value("Buying Settings", "project_update_frequency") != "Each Transaction":
+			return
+
+		receipts = {}
+		projects = {self.get_receipt_dimension(receipts, item, "project") for item in self.get("items")}
+		update_purchase_cost(projects - {None, ""})
 
 	def update_claimed_landed_cost(self):
-		for row in self.vendor_invoices:
+		for vendor_invoice in {row.vendor_invoice for row in self.vendor_invoices}:
 			frappe.db.set_value(
 				"Purchase Invoice",
-				row.vendor_invoice,
+				vendor_invoice,
 				"claimed_landed_cost_amount",
-				flt(row.amount, row.precision("amount")) if self.docstatus == 1 else 0.0,
+				get_claimed_landed_cost(vendor_invoice),
 			)
+
+	def validate_vendor_invoice_claims(self):
+		claimed_by_invoice = {}
+		for row in self.vendor_invoices:
+			claimed_by_invoice[row.vendor_invoice] = claimed_by_invoice.get(row.vendor_invoice, 0) + flt(
+				row.amount
+			)
+
+		for vendor_invoice, amount in claimed_by_invoice.items():
+			invoice_total = frappe.db.get_value(
+				"Purchase Invoice", vendor_invoice, "base_total", for_update=True
+			)
+			unclaimed_amount = flt(invoice_total) - flt(
+				get_claimed_landed_cost(vendor_invoice, exclude_voucher=self.name, for_update=True)
+			)
+			if flt(amount, 2) > flt(unclaimed_amount, 2):
+				frappe.throw(
+					_("Claimed amount {0} for Vendor Invoice {1} exceeds its unclaimed amount {2}").format(
+						frappe.bold(amount), frappe.bold(vendor_invoice), frappe.bold(unclaimed_amount)
+					)
+				)
 
 	def update_landed_cost(self):
 		for d in self.get("purchase_receipts"):
@@ -495,7 +595,9 @@ class LandedCostVoucher(Document):
 	def update_rate_in_serial_no_for_non_asset_items(self, receipt_document):
 		for item in receipt_document.get("items"):
 			if not item.is_fixed_asset and item.serial_no:
-				serial_nos = get_serial_nos(item.serial_no)
+				serial_nos = SerialBatchIdentity("Serial No").resolve(
+					item.item_code, get_serial_nos(item.serial_no), ignore_permissions=True
+				)
 				if serial_nos:
 					serial_no = frappe.qb.DocType("Serial No")
 					(
@@ -506,6 +608,7 @@ class LandedCostVoucher(Document):
 
 	@frappe.whitelist()
 	def get_vendor_invoice_amount(self, vendor_invoice: str):
+		frappe.has_permission("Purchase Invoice", "read", vendor_invoice, throw=True)
 		filters = frappe._dict(
 			{
 				"name": vendor_invoice,
@@ -521,6 +624,13 @@ class LandedCostVoucher(Document):
 		return {
 			"amount": amount,
 		}
+
+
+def check_receipt_document_access(receipt_document_type, receipt_document):
+	if receipt_document_type not in RECEIPT_DOCUMENT_TYPES:
+		frappe.throw(_("Receipt Document Type {0} is not supported").format(receipt_document_type))
+
+	frappe.has_permission(receipt_document_type, "select", receipt_document, throw=True)
 
 
 def get_pr_items(purchase_receipt):
@@ -566,8 +676,8 @@ def get_pr_items(purchase_receipt):
 		query = query.where(pr_item.is_finished_item == 1)
 	else:
 		query = query.select(
-			pr_item.base_rate,
-			pr_item.base_amount,
+			pr_item.base_net_rate.as_("base_rate"),
+			pr_item.base_net_amount.as_("base_amount"),
 			pr_item.is_fixed_asset,
 		)
 
@@ -586,6 +696,8 @@ def get_vendor_invoices(
 		frappe.throw(_("Invalid search query"), title=_("Invalid Query"))
 
 	query = get_vendor_invoice_query(filters)
+	for condition in get_match_conditions_qb("Purchase Invoice"):
+		query = query.where(condition)
 
 	if txt:
 		query = query.where(frappe.qb.DocType(doctype).name.like(f"%{txt}%"))
@@ -594,6 +706,34 @@ def get_vendor_invoices(
 		query = query.limit(page_len).offset(start)
 
 	return query.run(as_list=True)
+
+
+def absorb_rounding_difference(items, diff, precision, total):
+	sign = -1 if flt(total) < 0 else 1
+	for item in reversed(items):
+		if not diff:
+			break
+
+		share = flt(item.applicable_charges) * sign
+		adjustment = diff if diff * sign > 0 else sign * max(diff * sign, -share)
+		item.applicable_charges = flt(flt(item.applicable_charges) + adjustment, precision)
+		diff = flt(diff - adjustment, precision)
+
+
+def get_claimed_landed_cost(vendor_invoice, exclude_voucher=None, for_update=False):
+	vendor_invoice_row = frappe.qb.DocType("Landed Cost Vendor Invoice")
+	query = (
+		frappe.qb.from_(vendor_invoice_row)
+		.select(vendor_invoice_row.amount)
+		.where((vendor_invoice_row.vendor_invoice == vendor_invoice) & (vendor_invoice_row.docstatus == 1))
+	)
+	if exclude_voucher:
+		query = query.where(vendor_invoice_row.parent != exclude_voucher)
+
+	if for_update:
+		query = query.for_update()
+
+	return sum(flt(amount) for amount in query.run(pluck=True))
 
 
 def get_vendor_invoice_query(filters):
